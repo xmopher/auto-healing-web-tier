@@ -132,6 +132,25 @@ Visit `http://<alb_dns_name>/` for the NGINX welcome page.
 terraform destroy -var-file=example.tfvars
 ```
 
+## Optional CI (GitHub Actions)
+
+Workflow: [`.github/workflows/terraform.yml`](.github/workflows/terraform.yml)
+
+| Job | What it runs | AWS secrets required? |
+|-----|--------------|------------------------|
+| `fmt & validate` | `terraform fmt -check`, `init`, `validate` | No |
+| `plan-only` | `terraform plan -var-file=example.tfvars` | Yes |
+
+To enable **plan-only** in Actions:
+
+1. Repo → **Settings** → **Secrets and variables** → **Actions**
+2. Add repository secrets:
+   - `AWS_ACCESS_KEY_ID`
+   - `AWS_SECRET_ACCESS_KEY`
+3. Prefer a dedicated IAM user with least privilege for CI (or reuse the homework user for this short assessment).
+
+Without those secrets, `fmt & validate` still runs on every push/PR; the plan job is skipped automatically.
+
 ## Optional Docker bonus
 
 - [`Dockerfile`](Dockerfile) builds from `nginx:alpine`.
