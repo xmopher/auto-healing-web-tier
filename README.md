@@ -136,10 +136,10 @@ terraform destroy -var-file=example.tfvars
 
 Workflow: [`.github/workflows/terraform.yml`](.github/workflows/terraform.yml)
 
-| Job | What it runs | AWS secrets required? |
-|-----|--------------|------------------------|
-| `fmt & validate` | `terraform fmt -check`, `init`, `validate` | No |
-| `plan-only` | `terraform plan -var-file=example.tfvars` | Yes |
+| Step | What it runs | AWS secrets required? |
+|------|--------------|------------------------|
+| `fmt` / `validate` | Always on push/PR | No |
+| `plan-only` | Runs only if secrets exist | Yes (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) |
 
 To enable **plan-only** in Actions:
 
