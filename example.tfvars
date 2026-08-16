@@ -1,5 +1,10 @@
-aws_region   = "ap-southeast-2"
-project_name = "autoheal-web"
-environment  = "dev"
-owner        = "xmopher"
-vpc_cidr     = "10.0.0.0/16"
+aws_region       = "ap-southeast-2"
+project_name     = "autoheal-web"
+environment      = "dev"
+owner            = "xmopher"
+vpc_cidr         = "10.0.0.0/16"
+instance_type    = "t3.micro"
+desired_capacity = 2
+min_size         = 2
+max_size         = 4
+docker_image     = "nginx:alpine"

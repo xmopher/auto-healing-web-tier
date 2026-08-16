@@ -1,0 +1,14 @@
+#!/bin/bash
+set -euo pipefail
+
+# Install and start Docker on Amazon Linux 2023
+dnf install -y docker
+systemctl enable --now docker
+
+# Pull and run the web container; restart policy supports instance reboot
+docker pull "${docker_image}"
+docker run -d \
+  --name web \
+  --restart=always \
+  -p 80:80 \
+  "${docker_image}"
