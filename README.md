@@ -1,225 +1,246 @@
-# Auto-Healing Web Tier (AWS)
+# Auto-Healing Web Tier (AWS + Terraform)
 
-Terraform take-home that stands up a self-healing, N+1 static web tier behind an Application Load Balancer.
+A self-healing, N+1 static web tier: an Application Load Balancer spreading traffic across at least two EC2 instances managed by an Auto Scaling Group. Terminating any single instance does not take the site down, and the platform replaces it automatically.
 
 **Repository:** https://github.com/xmopher/auto-healing-web-tier
 
-## Cloud choice
+## Cloud choice: AWS
 
-**AWS** (Terraform) was chosen because:
+- **Auto Scaling Group** gives VM-level self-healing natively: an instance that is terminated or fails its health check is replaced with no operator action.
+- **Application Load Balancer** with target-group health checks keeps traffic on healthy targets only, which is what makes "lose any single VM without downtime" true rather than aspirational.
+- The building blocks are few and cheap (no NAT Gateway, no managed control plane), so the design stays inside a small budget and inside the 7–8 hour target effort.
 
-- **Auto Scaling Groups** replace terminated instances automatically (self-healing at the VM layer).
-- **Application Load Balancer** + target-group health checks keep traffic on healthy instances only (no downtime when one VM is lost).
-- The pattern matches a typical Infrastructure Engineer web-tier design and stays simple enough to keep cost low (small instances, no NAT Gateway).
-
-Azure VMSS would also work; AWS ASG + ALB is the stack I can deliver most cleanly for this brief.
+Azure VMSS + Load Balancer would satisfy the same brief. I chose AWS because ASG/ALB is the stack I can deliver most cleanly and cost-transparently here. Kubernetes (EKS) was deliberately rejected: the brief's healing unit is a VM, and an EKS control plane alone is roughly AUD 110/month, which would breach the cost target before a single instance runs.
 
 ## Architecture
 
 ```text
                         Internet
                            |
-                     ALB (:80 HTTP)
+                    ALB (HTTP :80)
+                    public subnets, 2 AZs
+                           |
+                    Target Group
+                    health check GET / -> 200
                            |
               +------------+------------+
               |                         |
-         Target Group              Health check
-         (HTTP /, 200)             path = /
-              |
-     +--------+--------+
-     |                 |
-  EC2 (AZ-a)        EC2 (AZ-b)
-  Docker/NGINX      Docker/NGINX
-     ^                 ^
-     +--------+--------+
-              |
-     Auto Scaling Group
-     min=2 desired=2 max=4
-     health_check_type = ELB
+        EC2 (AZ-a)                EC2 (AZ-b)
+        Docker -> NGINX           Docker -> NGINX
+              |                         |
+              +------------+------------+
+                           |
+                  Auto Scaling Group
+                  min=2  desired=2  max=4
+                  health_check_type = ELB
 ```
 
 ```mermaid
 flowchart TB
-  users[Users] --> alb[Application Load Balancer]
-  alb --> tg[Target Group<br/>HTTP :80 / health check]
+  users[Users] --> alb[Application Load Balancer<br/>HTTP :80]
+  alb --> tg[Target Group<br/>health check GET /]
   tg --> i1[EC2 AZ-a<br/>Docker nginx]
   tg --> i2[EC2 AZ-b<br/>Docker nginx]
-  asg[Auto Scaling Group<br/>min/desired = 2] -.manages.-> i1
-  asg -.manages.-> i2
-  subgraph vpc [VPC 10.0.0.0/16]
-    alb
-    tg
-    i1
-    i2
-    asg
-  end
+  asg[Auto Scaling Group<br/>min/desired 2, max 4] -.launches and replaces.-> i1
+  asg -.launches and replaces.-> i2
 ```
 
 A draw.io-friendly copy lives in [`docs/architecture.md`](docs/architecture.md).
 
-### How must-haves are met
+### How the must-haves are met
 
 | Requirement | Implementation |
 |-------------|----------------|
-| Self-healing | ASG replaces unhealthy/terminated instances; ALB stops sending traffic until the replacement is healthy |
-| Self-provisioning (IaC) | `terraform apply` creates everything; a second apply should show no changes |
-| N+1 capacity | `min_size` / `desired_capacity` = 2 across two AZs behind one ALB |
-| Static web page | Each instance runs NGINX via Docker (`nginx:alpine` by default) |
-| Idempotent modules | Separate `network`, `alb`, `asg` modules with shared naming/tags |
+| Self-healing | ASG with `health_check_type = ELB`; a terminated or unhealthy instance is replaced automatically, and the ALB stops routing to it immediately |
+| Self-provisioning (IaC only) | `terraform apply` builds everything from an empty account; no console steps |
+| Idempotent | A second run reports no changes (see the caveat about AMI lookup under Assumptions) |
+| N + 1 capacity | `min_size = desired_capacity = 2` across two AZs behind one ALB |
+| Static web page | NGINX welcome page served from a container on each instance |
+| Templates | Terraform 1.15 with AWS provider `~> 5.0`, split into `network` / `alb` / `asg` modules |
 
 ## Repository layout
 
 ```text
 .
-├── main.tf / variables.tf / outputs.tf / providers.tf / versions.tf
-├── example.tfvars
-├── Dockerfile
+├── versions.tf / providers.tf / variables.tf / main.tf / outputs.tf
+├── example.tfvars              # sample inputs
+├── Dockerfile                  # optional bonus image
 ├── modules/
-│   ├── network/   # VPC, public subnets, IGW, security groups
-│   ├── alb/       # ALB, target group, listener
-│   └── asg/       # Launch template, ASG, user-data
-└── docs/architecture.md
+│   ├── network/                # VPC, public subnets, IGW, routing, security groups
+│   ├── alb/                    # ALB, target group, listener
+│   └── asg/                    # launch template, ASG, user-data
+├── docs/architecture.md
+└── .github/workflows/terraform.yml
 ```
 
-**Naming:** `{project}-{environment}-...` (default `autoheal-web-dev-...`)  
-**Tags (default_tags):** `Project`, `Environment`, `Owner`, `ManagedBy=terraform`
+**Naming:** every resource is prefixed `{project_name}-{environment}`, e.g. `autoheal-web-dev-alb`.
+
+**Tagging:** applied globally through provider `default_tags` — `Project`, `Environment`, `Owner`, `ManagedBy = terraform`.
 
 ## Prerequisites
 
-- Terraform `>= 1.5` (tested with `1.15.x`)
-- AWS credentials with permission to manage VPC, EC2, ELBv2, Auto Scaling, IAM (if extended later)
-- Optional: Docker (to build/push the bonus image)
+- Terraform `>= 1.5` (developed and verified on 1.15.8)
+- AWS credentials able to manage VPC, EC2, ELBv2 and Auto Scaling
+- Optional: Docker, if you want to build and publish your own page image
 
-```powershell
-aws sts get-caller-identity
+```bash
 terraform version
+aws sts get-caller-identity
 ```
 
 ## Usage
 
-### 1) Init
+```bash
+git clone https://github.com/xmopher/auto-healing-web-tier.git
+cd auto-healing-web-tier
+```
 
-```powershell
-cd D:\Project\devops_homework
+### 1. Initialise
+
+```bash
 terraform init
 ```
 
-### 2) Plan (recommended deliverable)
+### 2. Plan — this is the intended review artefact
 
-```powershell
+```bash
 terraform plan -var-file=example.tfvars
 ```
 
-Reviewers can rely on plan output without applying. Provisioning is optional per the brief.
+Verified locally against `ap-southeast-2`:
 
-### 3) Apply (optional)
-
-```powershell
-terraform apply -var-file=example.tfvars
+```text
+Plan: 14 to add, 0 to change, 0 to destroy.
 ```
 
-After apply, open the ALB DNS from outputs:
+### 3. Apply (optional)
 
-```powershell
+```bash
+terraform apply -var-file=example.tfvars
 terraform output alb_dns_name
 ```
 
-Visit `http://<alb_dns_name>/` for the NGINX welcome page.
+Browse to `http://<alb_dns_name>/` for the NGINX welcome page. Allow two to three minutes for instances to pass health checks after apply returns.
 
-### 4) Destroy (recommended after demo)
+### 4. Destroy
 
-```powershell
+```bash
 terraform destroy -var-file=example.tfvars
 ```
 
-## Optional CI (GitHub Actions)
+### Verifying self-healing
 
-Workflow: [`.github/workflows/terraform.yml`](.github/workflows/terraform.yml)
+1. Confirm two healthy targets in the ALB target group.
+2. Terminate one instance (console or `aws ec2 terminate-instances`).
+3. The ALB serves continuously from the surviving instance while the ASG launches a replacement, which joins the target group once healthy.
 
-| Step | What it runs | AWS secrets required? |
-|------|--------------|------------------------|
-| `fmt` / `validate` | Always on push/PR | No |
-| `plan-only` | Runs only if secrets exist | Yes (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) |
+## Input variables
 
-To enable **plan-only** in Actions:
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `aws_region` | `ap-southeast-2` | Deployment region |
+| `project_name` | `autoheal-web` | Name prefix and `Project` tag |
+| `environment` | `dev` | Name prefix and `Environment` tag |
+| `owner` | `xmopher` | `Owner` tag |
+| `vpc_cidr` | `10.0.0.0/16` | VPC address space |
+| `instance_type` | `t3.micro` | Web instance size — the main compute cost lever |
+| `desired_capacity` / `min_size` | `2` | N+1 capacity; validation rejects values below 2 |
+| `max_size` | `4` | Headroom for replacement and scaling |
+| `docker_image` | `nginx:alpine` | Image pulled by user-data |
 
-1. Repo → **Settings** → **Secrets and variables** → **Actions**
-2. Add repository secrets:
-   - `AWS_ACCESS_KEY_ID`
-   - `AWS_SECRET_ACCESS_KEY`
-3. Prefer a dedicated IAM user with least privilege for CI (or reuse the homework user for this short assessment).
+## Optional bonus: containerised page
 
-Without those secrets, `fmt & validate` still runs on every push/PR; the plan job is skipped automatically.
+- [`Dockerfile`](Dockerfile) builds on `nginx:alpine`.
+- Instance user-data installs Docker, pulls `var.docker_image`, and runs it with `--restart=always` on port 80.
+- The default is the public `nginx:alpine`, so no registry credentials are needed for a reviewer to run a plan.
 
-## Optional Docker bonus
+To publish and use your own image:
 
-- [`Dockerfile`](Dockerfile) builds from `nginx:alpine`.
-- Instance **user-data** installs Docker, pulls `var.docker_image`, and runs it on port 80.
-- Default image is public `nginx:alpine` (no registry login required).
-
-To use your own image (GHCR / Docker Hub):
-
-```powershell
+```bash
 docker build -t ghcr.io/<you>/auto-healing-web-tier:latest .
 docker push ghcr.io/<you>/auto-healing-web-tier:latest
 ```
 
-Then set in a local `terraform.tfvars` (not committed):
-
 ```hcl
+# terraform.tfvars (not committed)
 docker_image = "ghcr.io/<you>/auto-healing-web-tier:latest"
 ```
 
+Private images would additionally need an instance profile plus a registry login in user-data; out of scope here.
+
+## Pipeline
+
+[`.github/workflows/terraform.yml`](.github/workflows/terraform.yml) runs on every push and pull request to `main`:
+
+| Step | Requires AWS credentials |
+|------|--------------------------|
+| `terraform fmt -check -recursive` | No |
+| `terraform init -backend=false` | No |
+| `terraform validate` | No |
+| `terraform plan -var-file=example.tfvars` | Yes — skipped automatically when secrets are absent |
+
+Add `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` under Settings → Secrets and variables → Actions to enable the plan step. It is plan-only by design; nothing in CI applies.
+
 ## Assumptions
 
-1. Region defaults to **ap-southeast-2** (Sydney).
-2. **Public subnets only** — no NAT Gateway (major cost saving). Instances get public IPs to pull images/packages; SSH is not exposed (instance SG allows port 80 only from the ALB SG).
-3. HTTP only on port 80 (no ACM/HTTPS) to keep scope and cost small.
-4. Default container image `nginx:alpine` is acceptable for the static welcome page.
-5. Reviewers may evaluate **`terraform plan` only**; long-running apply is optional.
-6. Prices below are approximate on-demand figures for Sydney and will vary with FX, LCU usage, and Free Tier eligibility.
+1. Region is `ap-southeast-2` (Sydney), appropriate for an Australian audience.
+2. Public subnets only, no NAT Gateway. Instances hold public IPs so they can pull packages and images; a NAT Gateway would add roughly AUD 55/month for no benefit at this scale.
+3. Instances accept port 80 only from the ALB security group. No SSH ingress and no key pair; use SSM Session Manager if shell access is ever needed.
+4. HTTP only. HTTPS would require ACM plus a domain, which is outside the brief.
+5. State is local. A shared team setup would use an S3 backend with DynamoDB locking; that would need bootstrap resources that the "one command" requirement discourages.
+6. The AMI is resolved with a `most_recent` lookup of Amazon Linux 2023. Repeat plans are stable until AWS publishes a new AMI, at which point the launch template will show a change. Pinning `image_id` to a variable would make idempotency absolute at the cost of manual AMI updates — a trade-off I would resolve with the team's patching policy.
+7. Cost figures below are on-demand list prices for Sydney at 730 hours per month, converted at 1 USD ≈ 1.55 AUD. They exclude account-level free tier or promotional credits.
 
-## Estimated monthly cost (AUD)
+## Estimated monthly cost
 
-**Design-to-cost choices:** `t3.micro`, two instances only, no NAT, no bastion, minimal EBS, ALB only (no WAF/CloudFront).
+### Fully deployed, running 24×7
 
-Approximate on-demand (730 h/month, FX ≈ 1 USD = 1.55 AUD):
+| Component | Unit price (USD) | Monthly USD | Monthly AUD |
+|-----------|------------------|-------------|-------------|
+| ALB, fixed hours | 0.0225 /hr | 16.43 | ~25.50 |
+| ALB, LCU (near-idle demo traffic) | 0.008 /LCU-hr | 0–5.80 | ~0–9.00 |
+| EC2, 2 × `t3.micro` | 0.0132 /hr each | 19.27 | ~29.90 |
+| EBS, 2 × 8 GB gp3 | 0.096 /GB-month | 1.54 | ~2.40 |
+| NAT Gateway | — | 0 | 0 (deliberately omitted) |
+| Data transfer out | first 100 GB free | ~0 | ~0 |
+| **Total** | | **~37–43** | **~AUD 58–67** |
 
-| Resource | Approx. monthly (AUD) | Notes |
-|----------|------------------------|-------|
-| EC2 2× `t3.micro` | ~30 | ~USD 0.0132/h each |
-| Application Load Balancer (hours) | ~25–30 | Dominant fixed cost |
-| EBS (gp3, small root volumes) | ~2–4 | Depends on AMI defaults |
-| Data transfer / LCU | ~0–3 | Negligible for a demo page |
-| NAT Gateway | **0** | Intentionally omitted |
-| **Sustained 24×7 total** | **~60** | Exceeds AUD 20 if left running all month |
+### On the ≤ AUD 20 target
 
-**How this stays within ≤ AUD 20 for the assessment**
+I want to be straight about this rather than present a number that only works on paper: **an always-on managed load balancer plus two instances in Sydney cannot be delivered for AUD 20 per month.** The ALB's fixed hourly charge alone is about AUD 25.50 before any compute, and every managed alternative (NLB, CLB) is priced the same or higher. Any estimate claiming otherwise is either excluding the load balancer, assuming free-tier credits that expire, or not running continuously.
 
-| Mode | Est. cost | Notes |
-|------|-----------|--------|
-| Plan-only (no apply) | **AUD 0** | Matches “review plan outputs only” |
-| Apply for review then destroy (e.g. ≤ 48 h) | **~AUD 3–6** | Full stack briefly for verification |
-| Free Tier eligible EC2 hours | Reduces EC2 line item | ALB still accrues while deployed |
+What the design does do is remove every avoidable cost around that floor:
 
-**Conclusion:** The stack is sized for a cheap lab. Continuous always-on ALB + 2× EC2 in Sydney typically exceeds AUD 20/month; the intended operating model for this homework is **plan-first**, and **destroy after any apply**, which keeps spend ≤ AUD 20.
+| Decision | Saving vs. a naive build |
+|----------|--------------------------|
+| No NAT Gateway (public subnets + tight security groups) | ~AUD 65/month |
+| No EKS control plane | ~AUD 110/month |
+| Burstable `t3.micro` instead of a `t3.medium` pair | ~AUD 90/month |
+| Minimal gp3 root volumes, no detailed monitoring, no WAF or CloudFront | ~AUD 15/month |
 
-Verify with the [AWS Pricing Calculator](https://calculator.aws/) before a long-running apply.
+And these are the levers that genuinely bring the running cost to or below AUD 20, with their trade-offs:
 
-## Self-healing demo (if applied)
+| Lever | Resulting cost | Trade-off |
+|-------|----------------|-----------|
+| Run as a part-time dev environment (~8 h × 5 days, destroyed or scaled to zero otherwise) | ~AUD 14–16/month | Not continuously available; acceptable for dev, not for production |
+| `instance_type = "t3.nano"` (variable already exposed) | Total ~AUD 43–52/month | Halves compute; the ALB floor is unchanged |
+| `t4g.nano` on Graviton (needs an arm64 AMI filter) | Total ~AUD 40–49/month | Cheapest compliant compute; the ALB floor is unchanged |
+| Replace the ALB with Route 53 health-checked DNS records | ~AUD 15/month on nano instances | Rejected: the brief explicitly requires a load balancer, and DNS failover recovers only as fast as the TTL |
 
-1. Note two healthy targets in the ALB target group.
-2. Terminate one EC2 instance in the console.
-3. ASG launches a replacement; ALB drains/fails the old target and registers the new one.
-4. `http://<alb_dns_name>/` should remain available via the surviving instance during replacement.
+**My recommendation:** keep ALB + ASG as built, since it is the configuration that actually satisfies "lose any single VM without downtime". Budget roughly AUD 58–67/month for a 24×7 production-shaped tier in Sydney, or roughly AUD 15/month if it runs only during working hours. If AUD 20 were a hard ceiling on a live always-on service, the honest conversation is about relaxing either the managed-load-balancer requirement or the always-on requirement — I would not hide that behind an optimistic spreadsheet.
 
-## What is intentionally out of scope
+For this assessment no apply is required, so reviewing the plan output costs nothing. That is a statement about the review process, not a way of meeting the budget.
 
-- HTTPS / ACM certificates
-- Private subnets + NAT
-- CI apply to a shared account (lint/validate/plan-only would be enough if added)
-- Multi-environment promotions (only `dev` defaults)
+Figures are worth re-checking in the [AWS Pricing Calculator](https://calculator.aws/) before any long-running deployment.
+
+## Out of scope
+
+- HTTPS/ACM and a custom domain
+- Private subnets, NAT, and SSM-only access
+- Remote state backend and state locking
+- Blue/green or rolling deployment strategy beyond ASG instance refresh
+- Multi-environment promotion; only `dev` defaults are provided
 
 ## Commit history
 
-Incremental commits follow the build order: scaffold → network → ALB → ASG → docs.
+Commits follow the build order so the process is visible: repository setup → Terraform scaffold and conventions → network module → provider lock → ALB module → ASG with user-data → documentation → CI.
