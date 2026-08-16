@@ -9,7 +9,14 @@ locals {
   }
 }
 
-# Root wiring for modules will be added in later commits:
-# - module "network"
+module "network" {
+  source = "./modules/network"
+
+  name_prefix = local.name_prefix
+  vpc_cidr    = var.vpc_cidr
+  az_count    = 2
+}
+
+# Later commits:
 # - module "alb"
 # - module "asg"
