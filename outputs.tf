@@ -17,3 +17,13 @@ output "instance_security_group_id" {
   description = "Instance security group ID"
   value       = module.network.instance_security_group_id
 }
+
+output "alb_dns_name" {
+  description = "Public DNS name of the ALB"
+  value       = module.alb.alb_dns_name
+}
+
+output "target_group_arn" {
+  description = "Target group ARN for the ASG"
+  value       = module.alb.target_group_arn
+}
